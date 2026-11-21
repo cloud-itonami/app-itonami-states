@@ -1,0 +1,136 @@
+#!/usr/bin/env nbb
+;; bin/verify-bpmn-wellformedness.cljk — gate on the BPMN well-formedness census.
+;; Reads files only; writes nothing. Uses only what nbb ships (clojure.edn) plus
+;; node fs / path / child_process. No new dependency, no package.json change.
+;;
+;; Each BPMN file is checked with the system `xmllint --noout`. The scan runs in
+;; batches (many files per xmllint invocation, passed as an argument array —
+;; never through a shell string) so several thousand files stay practical.
+;; The scan result must match storage/bpmn-wellformedness.edn exactly; any drift
+;; in any direction fails. A recorded file that has become well-formed also
+;; fails, so the recorded list is kept exact: the message says to remove it.
+(ns verify-bpmn-wellformedness
+  (:require [clojure.edn :as edn]
+            [clojure.string :as str]))
+
+(def fs (js/require "fs"))
+(def path (js/require "path"))
+(def child-process (js/require "child_process"))
+
+;; Run from the repository root: all record paths are relative to the cwd.
+(def root (.cwd js/process))
+(def record-path (.join path root "storage" "bpmn-wellformedness.edn"))
+(def gov-dir (.join path root "data" "gov"))
+
+;; Files per xmllint invocation. Keeps the scan to dozens of spawns.
+(def batch-size 100)
+
+(defn walk-bpmn [dir]
+  (let [out #js []]
+    (letfn [(walk [d]
+              (doseq [e (.readdirSync fs d #js {:withFileTypes true})]
+                (let [p (.join path d (.-name e))]
+                  (cond
+                    (.isDirectory e) (walk p)
+                    (and (.isFile e) (str/ends-with? (.-name e) ".bpmn"))
+                    (.push out (.relative path root p))))))]
+      (walk dir))
+    (sort (js->clj out))))
+
+(defn fail! [errors]
+  (doseq [e errors] (println "FAIL:" e))
+  (js/process.exit 1))
+
+(defn require-xmllint! []
+  (let [res (try
+              (.spawnSync child-process "xmllint" #js ["--version"])
+              (catch :default e
+                (fail! [(str "cannot run xmllint --version: " (.-message e)
+                             " — install the system xmllint (libxml2) and re-run")])))]
+    (when (.-error res)
+      (fail! [(str "xmllint is not installed: " (.. res -error -message)
+                   " — install the system xmllint (libxml2) and re-run")]))))
+
+;; Run one batch. Returns the subset of batch files that are not well-formed.
+;; A file is malformed iff its own xmllint --noout exits non-zero; the batch
+;; stderr prefix parse is only the fast path, and any batch whose exit status
+;; disagrees with the parse falls back to one argv-array invocation per file.
+(defn scan-batch [batch]
+  (let [argv (clj->js (into ["--noout"] batch))
+        res (.spawnSync child-process "xmllint" argv)]
+    (when (.-error res)
+      (fail! [(str "cannot run xmllint: " (.. res -error -message))]))
+    (let [status (.-status res)
+          stderr (.toString (.-stderr res) "utf8")
+          matched (filter #(some (fn [line] (str/starts-with? line (str % ":")))
+                                 (str/split stderr #"\n"))
+                           batch)]
+      (if (and (zero? status) (str/blank? stderr))
+        []
+        (if (and (not (zero? status)) (seq matched))
+          (vec matched)
+          ;; Fallback: pinpoint each file with its own argument-array call.
+          (vec (filter (fn [f]
+                         (let [r (.spawnSync child-process "xmllint"
+                                             (clj->js ["--noout" f]))]
+                           (when (.-error r)
+                             (fail! [(str "cannot run xmllint: " (.. r -error -message))]))
+                           (not (zero? (.-status r)))))
+                       batch)))))))
+
+(defn scan-all [files]
+  (vec (mapcat scan-batch (partition-all batch-size files))))
+
+(defn -main []
+  (require-xmllint!)
+  (let [errors (atom [])
+        record (try
+                 (edn/read-string (.readFileSync fs record-path "utf8"))
+                 (catch :default e
+                   (fail! [(str "cannot read record " record-path ": " (.-message e))])))]
+    (let [on-disk (walk-bpmn gov-dir)
+          malformed (scan-all on-disk)
+          malformed-set (set malformed)
+          recorded (:malformed-files record)
+          recorded-set (set recorded)
+          scanned-count (count on-disk)
+          malformed-count (count malformed)
+          well-formed-count (- scanned-count malformed-count)]
+      (println "scanned:" scanned-count)
+      (println "well-formed:" well-formed-count)
+      (println "malformed:" malformed-count)
+      ;; 1. Header counts must match the scan.
+      (when (not= (:file-count record) scanned-count)
+        (swap! errors conj (str "stale :file-count: record " (:file-count record)
+                                " actual " scanned-count)))
+      (when (not= (:well-formed-count record) well-formed-count)
+        (swap! errors conj (str "stale :well-formed-count: record " (:well-formed-count record)
+                                " actual " well-formed-count)))
+      (when (not= (:malformed-count record) malformed-count)
+        (swap! errors conj (str "stale :malformed-count: record " (:malformed-count record)
+                                " actual " malformed-count)))
+      ;; 2. The recorded list must be sorted and duplicate-free.
+      (when (not= recorded (sort recorded))
+        (swap! errors conj "recorded :malformed-files list is not sorted"))
+      (when (not= (count recorded) (count recorded-set))
+        (swap! errors conj "recorded :malformed-files list contains duplicates"))
+      ;; 3. Every recorded path must still exist.
+      (let [on-disk-set (set on-disk)]
+        (doseq [p (sort (filter #(not (contains? on-disk-set %)) recorded))]
+          (swap! errors conj (str "recorded path no longer exists: " p))))
+      ;; 4. No new malformed files beyond the recorded list.
+      (doseq [p (sort (filter #(not (contains? recorded-set %)) malformed))]
+        (swap! errors conj (str "new malformed BPMN file not on the recorded list: " p)))
+      ;; 5. A recorded file that has become well-formed must be removed.
+      (let [on-disk-set (set on-disk)]
+        (doseq [p (sort (filter #(and (contains? on-disk-set %)
+                                      (not (contains? malformed-set %)))
+                                recorded))]
+          (swap! errors conj (str "recorded file is now well-formed, remove it from the list: " p))))
+      (if (seq @errors)
+        (fail! @errors)
+        (println (str "ok: " scanned-count " scanned, "
+                      well-formed-count " well-formed, "
+                      malformed-count " malformed — matches the record"))))))
+
+(-main)
