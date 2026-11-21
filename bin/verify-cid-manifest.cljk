@@ -1,0 +1,141 @@
+#!/usr/bin/env nbb
+;; bin/verify-cid-manifest.cljk — recompute storage/cid-manifest.edn and fail on any drift.
+;; Reads files only; writes nothing. Uses only nbb built-ins (clojure.edn) plus
+;; node fs / path / crypto. No new dependency, no package.json change.
+(ns verify-cid-manifest
+  (:require [clojure.edn :as edn]
+            [clojure.string :as str]))
+
+(def fs (js/require "fs"))
+(def path (js/require "path"))
+(def crypto (js/require "crypto"))
+
+;; Run from the repository root: all manifest paths are relative to the cwd.
+(def root (.cwd js/process))
+(def manifest-path (.join path root "storage" "cid-manifest.edn"))
+(def gov-dir (.join path root "data" "gov"))
+
+(def fixed-bytes "hello world") ;; no trailing newline: exactly 11 bytes
+(def fixed-cid "bafkreifzjut3te2nhyekklss27nh3k72ysco7y32koao5eei66wof36n5e")
+
+(def b32 "abcdefghijklmnopqrstuvwxyz234567")
+
+;; base32, lower-case, no padding, over a node Buffer.
+(defn base32-encode [^js buf]
+  (let [nbits (* (.-length buf) 8)
+        nchars (int (js/Math.ceil (/ nbits 5)))]
+    (apply str
+      (map (fn [k]
+             (nth b32
+               (reduce (fn [v j]
+                         (let [p (+ (* k 5) j)
+                               bit (if (< p nbits)
+                                     (bit-and (bit-shift-right (aget buf (quot p 8))
+                                                               (- 7 (mod p 8))) 1)
+                                     0)]
+                           (+ (* v 2) bit)))
+                 0 (range 5))))
+        (range nchars)))))
+
+(defn sha256-hex [^js buf]
+  (.digest (.update (.createHash crypto "sha256") buf) "hex"))
+
+;; CIDv1, codec raw (0x55), multihash sha2-256, multibase base32 lower-case
+;; without padding (prefix "b"): "b" + b32(0x01 0x55 0x12 0x20 || sha256(bytes)).
+(defn cid-of [^js buf]
+  (let [digest (.digest (.update (.createHash crypto "sha256") buf))
+        prefix (.from js/Buffer #js [0x01 0x55 0x12 0x20])
+        both (.concat js/Buffer #js [prefix digest])]
+    (str "b" (base32-encode both))))
+
+(defn count-rows [^js buf]
+  (count (filter #(pos? (count %))
+                 (str/split (.toString buf "utf8") #"\n"))))
+
+(defn walk-ndjson [dir]
+  (let [out #js []]
+    (letfn [(walk [d]
+              (doseq [e (.readdirSync fs d #js {:withFileTypes true})]
+                (let [p (.join path d (.-name e))]
+                  (cond
+                    (.isDirectory e) (walk p)
+                    (and (.isFile e) (str/ends-with? (.-name e) ".ndjson"))
+                    (.push out (.relative path root p))))))]
+      (walk dir))
+    (sort (js->clj out))))
+
+(defn fail! [errors]
+  (doseq [e errors] (println "FAIL:" e))
+  (js/process.exit 1))
+
+(defn -main []
+  (let [errors (atom [])
+        manifest (try
+                   (edn/read-string (.readFileSync fs manifest-path "utf8"))
+                   (catch :default e
+                     (fail! [(str "cannot read manifest " manifest-path ": " (.-message e))])))]
+    ;; 1. Fixed vector from the task definition (independent of this repository).
+    (let [actual (cid-of (.from js/Buffer fixed-bytes "utf8"))]
+      (println "fixed-vector expected:" fixed-cid)
+      (println "fixed-vector actual:  " actual)
+      (if (= actual fixed-cid)
+        (println "fixed-vector: OK")
+        (swap! errors conj (str "fixed vector mismatch: derived " actual
+                                " differs from the task definition " fixed-cid
+                                " — encoding derivation is wrong, not the vector"))))
+    ;; 2. Recompute every row.
+    (let [files (:files manifest)]
+      (doseq [row files]
+        (let [rel (:path row)
+              abs (.join path root rel)
+              buf (try (.readFileSync fs abs)
+                       (catch :default _ nil))]
+          (if (nil? buf)
+            (swap! errors conj (str "listed file missing: " rel))
+            (let [actual-bytes (.-length buf)
+                  actual-sha (sha256-hex buf)
+                  actual-cid (cid-of buf)]
+              (when (not= actual-bytes (:bytes row))
+                (swap! errors conj (str "stale :bytes for " rel
+                                        ": manifest " (:bytes row) " actual " actual-bytes)))
+              (when (not= actual-sha (:sha256 row))
+                (swap! errors conj (str "stale :sha256 for " rel)))
+              (when (not= actual-cid (:cid row))
+                (swap! errors conj (str "stale :cid for " rel
+                                        ": manifest " (:cid row) " actual " actual-cid)))
+              (if (str/ends-with? rel ".ndjson")
+                (let [actual-rows (count-rows buf)]
+                  (when (not (contains? row :rows))
+                    (swap! errors conj (str "missing :rows for NDJSON " rel)))
+                  (when (and (contains? row :rows) (not= actual-rows (:rows row)))
+                    (swap! errors conj (str "stale :rows for " rel
+                                            ": manifest " (:rows row) " actual " actual-rows))))
+                (when (contains? row :rows)
+                  (swap! errors conj (str "unexpected :rows for non-NDJSON " rel))))))))
+      ;; 3. No unlisted NDJSON under data/gov/.
+      (let [listed (set (map :path files))
+            on-disk (set (walk-ndjson gov-dir))]
+        (doseq [p (sort (filter #(not (contains? listed %)) on-disk))]
+          (swap! errors conj (str "unlisted NDJSON file: " p)))))
+    ;; 4. Header totals.
+    (let [files (:files manifest)
+          ndjson (filter #(str/ends-with? (:path %) ".ndjson") files)
+          sum-bytes (reduce + 0 (map #(:bytes % 0) files))
+          sum-rows (reduce + 0 (map #(:rows % 0) ndjson))]
+      (when (not= (:file-count manifest) (count files))
+        (swap! errors conj (str "stale :file-count: manifest " (:file-count manifest)
+                                " actual " (count files))))
+      (when (not= (:total-bytes manifest) sum-bytes)
+        (swap! errors conj (str "stale :total-bytes: manifest " (:total-bytes manifest)
+                                " actual " sum-bytes)))
+      (when (not= (:total-rows manifest) sum-rows)
+        (swap! errors conj (str "stale :total-rows: manifest " (:total-rows manifest)
+                                " actual " sum-rows)))
+      (println "files:" (count files))
+      (println "total-bytes:" sum-bytes)
+      (println "total-rows:" sum-rows))
+    (if (seq @errors)
+      (fail! @errors)
+      (println (str "ok: all " (count (:files manifest)) " rows verified")))))
+
+(-main)
