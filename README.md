@@ -112,6 +112,23 @@ listed file, or an unlisted `*.ndjson` under `data/gov/`, and checks the
 encoding against the fixed vector `hello world` (no newline) →
 `bafkreifzjut3te2nhyekklss27nh3k72ysco7y32koao5eei66wof36n5e`.
 
+## BPMN well-formedness census (`storage/bpmn-wellformedness.edn`)
+
+The count in item 1 above is recorded as data: every `*.bpmn` file under
+`data/gov/` (3,287 files) was checked with the system `xmllint --noout`;
+2,455 are not well-formed and 832 are well-formed, which matches the statement
+above, so that statement is left as is. The record lists each malformed path,
+sorted, with the tool and version used. It is a statement of fact, not an
+allow-list. Verify from the repository root:
+
+```bash
+nbb bin/verify-bpmn-wellformedness.cljk
+```
+
+It fails on any drift in either direction: a new malformed file, a recorded
+path that no longer exists, a recorded file that has become well-formed
+(remove it from the list), or header counts that differ from the scan.
+
 ## Licence
 
 Apache License 2.0 with the etzhayyim Charter Compliance Rider v3.1 — see
