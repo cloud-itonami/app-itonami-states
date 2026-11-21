@@ -93,6 +93,25 @@ a path that does not exist here; and `reports/` describes a `wasm/` tree of
 2,759 components that was **not** extracted into this repository. Treat any
 `60-apps/…` path in this repo as a reference to the pre-extraction monorepo.
 
+## CID manifest (`storage/cid-manifest.edn`)
+
+Every committed `*.ndjson` file under `data/gov/` (856 files, 3,807 non-empty
+lines measured at `f7ab426d`) plus `scripts/static-profile-data.json` has one
+row with `:path`, `:bytes`, `:sha256`, `:cid` and, for NDJSON, `:rows`. Each
+`:cid` is the single-raw-block identifier — CIDv1, codec `raw`, multihash
+sha2-256, base32 lower-case without padding: `"b" + base32(0x01 0x55 0x12 0x20
+|| sha256(file))`. It says nothing about availability on any network. BPMN
+files and everything else are out of scope. Verify from the repository root:
+
+```bash
+nbb bin/verify-cid-manifest.cljk
+```
+
+It recomputes every row and the header totals, fails on a stale row, a missing
+listed file, or an unlisted `*.ndjson` under `data/gov/`, and checks the
+encoding against the fixed vector `hello world` (no newline) →
+`bafkreifzjut3te2nhyekklss27nh3k72ysco7y32koao5eei66wof36n5e`.
+
 ## Licence
 
 Apache License 2.0 with the etzhayyim Charter Compliance Rider v3.1 — see
